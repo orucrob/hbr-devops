@@ -1,0 +1,303 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: 'Devops (codebuild, codepipeline) IaC'
+
+Parameters:
+  Env:
+    Type: String
+    Default: 'dev'
+    Description: 'ID for environment (stage). Must be unique in account. Represents also the branch in GIT.'
+  Repo:
+    Description: 'codecommit repo in this account and this region with module source files.'
+    Type: String
+    Default: "hbr-devops"
+  ArtifactBucket:
+    Description: 'Devops S3 bucket for storing artifacts from build.'
+    Type: String
+    Default: "devops-bucket"
+
+Resources:
+  #CodeBuild
+  CodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${Repo}-${Env}
+      Source:
+        Type: CODECOMMIT
+        Location: !Sub 'https://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/${Repo}'
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/nodejs:10.14.1
+        ComputeType:  BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - Name: BRANCH
+            Type: PLAINTEXT
+            Value: !Ref Env
+          - Name: DEVOPS_S3BUCKET
+            Type: PLAINTEXT
+            Value: !Ref ArtifactBucket
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+  #Role for CodeBuild
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub cb-${AWS::StackName}-role  
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: !Sub cb-${AWS::StackName}-policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:DescribeLogStreams"
+                  - "logs:DescribeLogGroups"
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action: 
+                  - "codecommit:GitPull"
+                Resource: !Sub "arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${Repo}"
+              - Effect: Allow
+                Action: 
+                  - "s3:*"
+                Resource: !Sub "arn:aws:s3:::${ArtifactBucket}/*" 
+  #CodePipeline
+  Pipeline: 
+    Type: AWS::CodePipeline::Pipeline 
+    Properties: 
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore: 
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages: 
+        - Name: Source 
+          Actions: 
+            - Name: SourceAction
+              ActionTypeId: 
+                Category: Source 
+                Owner: AWS 
+                Version: 1 
+                Provider: CodeCommit 
+              OutputArtifacts: 
+                - Name: SourceOutput 
+              Configuration: 
+                RepositoryName: !Sub ${Repo} 
+                BranchName: !Sub ${Env}
+        - Name: Build   
+          Actions: 
+            - Name: BuildAction 
+              InputArtifacts: 
+                - Name: SourceOutput 
+              OutputArtifacts: 
+                - Name: BuildOutput 
+              ActionTypeId: 
+                Category: Build 
+                Owner: AWS 
+                Version: 1 
+                Provider: CodeBuild
+              Configuration: 
+                ProjectName: !Ref CodeBuild
+        - Name: Deploy   
+          Actions: 
+            # - Name: DeployAction 
+            #   InputArtifacts: 
+            #     - Name: BuildOutput 
+            #   ActionTypeId: 
+            #     Category: Deploy 
+            #     Owner: AWS 
+            #     Version: 1 
+            #     Provider: CloudFormation
+            #   Configuration: 
+            #     ActionMode: CREATE_UPDATE 
+            #     StackName: !Sub ${Repo}-${Env}
+            #     RoleArn: !GetAtt DeployRole.Arn 
+            #     TemplatePath: BuildOutput::packaged.yaml
+            #     Capabilities: CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND
+            - Name: CreateChangeSet 
+              RunOrder: 1
+              InputArtifacts: 
+                - Name: BuildOutput 
+              ActionTypeId: 
+                Category: Deploy 
+                Owner: AWS 
+                Version: 1 
+                Provider: CloudFormation
+              Configuration: 
+                ActionMode: CHANGE_SET_REPLACE 
+                StackName: !Sub ${Repo}-${Env}
+                ChangeSetName: !Sub hbr-devops-${Env}-changeset
+                RoleArn: !GetAtt DeployRole.Arn 
+                TemplatePath: BuildOutput::packaged.yaml
+                Capabilities: CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND
+            - Name: ExecuteChangeSet 
+              RunOrder: 2
+              ActionTypeId: 
+                Category: Deploy 
+                Owner: AWS 
+                Version: 1 
+                Provider: CloudFormation
+              Configuration: 
+                ActionMode: CHANGE_SET_EXECUTE 
+                StackName: !Sub ${Repo}-${Env}
+                ChangeSetName: !Sub hbr-devops-${Env}-changeset
+                RoleArn: !GetAtt DeployRole.Arn 
+                #TemplatePath: BuildOutput::packaged.yaml
+                #Capabilities: CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND
+
+  #Role for CodePipeline
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub pipeline-${AWS::StackName}-role  
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /service-role/
+      Policies:
+        - PolicyName: !Sub pipeline-${AWS::StackName}-policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - "iam:PassRole"
+                Resource: "*"
+                Condition:
+                  StringEqualsIfExists:
+                    iam:PassedToService:
+                      - "cloudformation.amazonaws.com"
+              - Effect: Allow
+                Action: 
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:DescribeLogStreams"
+                  - "logs:DescribeLogGroups"
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action: 
+                  - "codecommit:GitPull"
+                  - "codecommit:GetBranch"
+                  - "codecommit:GetCommit"
+                  - "codecommit:UploadArchive"
+                  - "codecommit:GetUploadArchiveStatus"
+                  - "codecommit:CancelUploadArchive"
+                Resource: !Sub "arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${Repo}"
+              - Effect: Allow
+                Action: 
+                  - "codebuild:BatchGetBuilds"
+                  - "codebuild:StartBuild"
+                Resource: !GetAtt CodeBuild.Arn
+              - Effect: Allow
+                Action: 
+                  - "s3:*"
+                Resource: !Sub "arn:aws:s3:::${ArtifactBucket}/*" 
+              - Effect: Allow
+                Action: 
+                  - "cloudformation:*"
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${Repo}-${Env}/*"
+  #Role for CodePipeline
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub deploy-${AWS::StackName}-role  
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - cloudformation.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /service-role/
+      Policies:
+        - PolicyName: !Sub deploy-${AWS::StackName}-policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow 
+                Action: 
+                  - "apigateway:*"
+                  - "codedeploy:*"
+                  - "lambda:*"
+                  - "cloudformation:CreateChangeSet"
+                  - "iam:GetRole"
+                  - "iam:CreateRole"
+                  - "iam:DeleteRole"
+                  - "iam:PutRolePolicy"
+                  - "iam:AttachRolePolicy"
+                  - "iam:DeleteRolePolicy"
+                  - "iam:DetachRolePolicy"
+                  - "iam:PassRole"
+                Resource: "*"
+              - Effect: Allow
+                Action: 
+                  - "s3:*"
+                Resource: !Sub "arn:aws:s3:::${ArtifactBucket}/*" 
+
+  #Cloudwatch rule
+  CWRule: 
+    Type: AWS::Events::Rule 
+    Properties: 
+      Description: CloudWatch Events rule to automatically start pipeline when a change occurs in the AWS CodeCommit repo ${Repo}
+      EventPattern:
+        source:
+          - "aws.codecommit"
+        detail-type: 
+          - "CodeCommit Repository State Change"
+        resources:
+          - !Sub "arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${Repo}"
+        detail:
+          event:
+            - "referenceCreated"
+            - "referenceUpdated"
+          referenceType:
+            - "branch"
+          referenceName:
+            - !Sub ${Env}
+      State: ENABLED
+      RoleArn: !GetAtt CWRuleRole.Arn 
+      Targets:
+        - Arn: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}" 
+          Id:  !Ref Pipeline
+          RoleArn: !GetAtt CWRuleRole.Arn 
+
+  #Role for Cloudwatch
+  CWRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub cw-${AWS::StackName}-role  
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /service-role/
+      Policies:
+        - PolicyName: !Sub cw-${AWS::StackName}-policy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - "codepipeline:*"
+                Resource: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}" 
+

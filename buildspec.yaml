@@ -1,0 +1,23 @@
+version: 0.2
+env:
+  variables:
+    key: "DEVOPS_S3BUCKET"
+ 
+phases:
+  install:
+    commands:
+      - echo Build enviromment `uname -a` `aws --version 2>&1` node/`node --version` npm/`npm --version`
+      - (cd hello-world; npm install)
+  pre_build:
+    commands:
+      - (cd hello-world; npm test)
+  
+  build:
+    commands:
+      - echo "packaging env (branch) ${BRANCH} - to bucket ${DEVOPS_S3BUCKET}"
+      - aws cloudformation package --template-file template.yaml --output-template-file packaged.yaml --s3-bucket ${DEVOPS_S3BUCKET}
+
+artifacts:
+  type: zip
+  files:
+    - packaged.yaml
